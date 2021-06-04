@@ -8,24 +8,47 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from scipy.ndimage.interpolation import rotate as scipyrotate
+from transformers import AutoModelForSequenceClassification
+
 from networks import MLP, ConvNet, LeNet, AlexNet, VGG11BN, VGG11, ResNet18, ResNet18BN_AP
 from torchvision.utils import save_image
 
 
-def eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, testloader, args, channel, num_classes, im_size):
+
+def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learningrate, batchsize_train, param_augment, device, Epoch = 600):
+    net = net.to(device)
+    images_train = images_train.to(device)
+    labels_train = labels_train.to(device)
+    lr = float(learningrate)
+    lr_schedule = [Epoch//2+1]
+    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    dst_train = TensorDataset(images_train, labels_train)
+    trainloader = torch.utils.data.DataLoader(dst_train, batch_size=batchsize_train, shuffle=True, num_workers=0)
+
+    start = time.time()
+    for ep in range(Epoch+1):
+        loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, param_augment, device)
+        if ep in lr_schedule:
+            lr *= 0.1
+            optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
+
+    time_train = time.time() - start
+    loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, param_augment, device)
+    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
+
+    return net, acc_train, acc_test
+
+
+def eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, testloader, args, num_classes):
     for model_eval in model_eval_pool:
-        print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, K = %d'%(args.model, model_eval, it))
-        param_augment = get_daparam(args.dataset, args.model, model_eval, args.ipc)
-        if param_augment['strategy'] != 'none':
-            epoch_eval_train = 1000 # More epochs for evaluation with augmentation will be better.
-            print('data augmentation = %s'%param_augment)
-        else:
-            epoch_eval_train = args.epoch_eval_train
+        print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, K = %d'%(args.model_name, model_eval, it))
         accs = []
         for it_eval in range(args.num_eval):
-            net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
+            net_eval = get_network(args, num_classes)
             image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
-            _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_net, args.batch_train, param_augment, args.device, epoch_eval_train)
+            _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_multiply_net, args.batch_train, args.device, args.epoch_eval_train)
             accs.append(acc_test)
         print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
         
@@ -93,20 +116,21 @@ def get_dataset(dataset, data_path):
     else:
         exit('unknown dataset: %s'%dataset)
 
-    return channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test
+    testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=2)
+    return channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader
 
 
 
 class TensorDataset(Dataset):
-    def __init__(self, images, labels): # images: n x c x h x w tensor
-        self.images = images.detach().float()
+    def __init__(self, text, labels): # images: n x c x h x w tensor
+        self.text = text.detach().float()
         self.labels = labels.detach()
 
     def __getitem__(self, index):
-        return self.images[index], self.labels[index]
+        return self.text[index], self.labels[index]
 
     def __len__(self):
-        return self.images.shape[0]
+        return self.text.shape[0]
 
 
 
@@ -116,82 +140,18 @@ def get_default_convnet_setting():
 
 
 
-def get_network(model, channel, num_classes, im_size=(32, 32)):
+def get_network(args, num_classes):
     torch.random.manual_seed(int(time.time() * 1000) % 100000)
-    net_width, net_depth, net_act, net_norm, net_pooling = get_default_convnet_setting()
-
-    if model == 'MLP':
-        net = MLP(channel=channel, num_classes=num_classes)
-    elif model == 'ConvNet':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling, im_size=im_size)
-    elif model == 'LeNet':
-        net = LeNet(channel=channel, num_classes=num_classes)
-    elif model == 'AlexNet':
-        net = AlexNet(channel=channel, num_classes=num_classes)
-    elif model == 'VGG11':
-        net = VGG11( channel=channel, num_classes=num_classes)
-    elif model == 'VGG11BN':
-        net = VGG11BN(channel=channel, num_classes=num_classes)
-    elif model == 'ResNet18':
-        net = ResNet18(channel=channel, num_classes=num_classes)
-    elif model == 'ResNet18BN_AP':
-        net = ResNet18BN_AP(channel=channel, num_classes=num_classes)
-
-    elif model == 'ConvNetD1':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=1, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetD2':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=2, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetD3':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=3, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetD4':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=4, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-
-    elif model == 'ConvNetW32':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=32, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetW64':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=64, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetW128':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=128, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetW256':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=256, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling=net_pooling)
-
-    elif model == 'ConvNetAS':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act='sigmoid', net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetAR':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act='relu', net_norm=net_norm, net_pooling=net_pooling)
-    elif model == 'ConvNetAL':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act='leakyrelu', net_norm=net_norm, net_pooling=net_pooling)
-
-    elif model == 'ConvNetNN':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm='none', net_pooling=net_pooling)
-    elif model == 'ConvNetBN':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm='batchnorm', net_pooling=net_pooling)
-    elif model == 'ConvNetLN':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm='layernorm', net_pooling=net_pooling)
-    elif model == 'ConvNetIN':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm='instancenorm', net_pooling=net_pooling)
-    elif model == 'ConvNetGN':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm='groupnorm', net_pooling=net_pooling)
-
-    elif model == 'ConvNetNP':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='none')
-    elif model == 'ConvNetMP':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='maxpooling')
-    elif model == 'ConvNetAP':
-        net = ConvNet(channel=channel, num_classes=num_classes, net_width=net_width, net_depth=net_depth, net_act=net_act, net_norm=net_norm, net_pooling='avgpooling')
-
-    else:
-        net = None
-        exit('DC error: unknown model')
-
+    net = AutoModelForSequenceClassification.from_pretrained('bert-base-cased', num_labels=num_classes)
+    # freeze_params(model) # freeze model except for classification layer
     gpu_num = torch.cuda.device_count()
-    if gpu_num>0:
+    if gpu_num > 0:
         device = 'cuda'
         if gpu_num>1:
             net = nn.DataParallel(net)
     else:
         device = 'cpu'
-    net = net.to(device)
+    net = net.to(args.device)
 
     return net
 
@@ -210,16 +170,9 @@ def distance_wb(gwr, gws):
     elif len(shape) == 3:  # layernorm, C*h*w
         gwr = gwr.reshape(shape[0], shape[1] * shape[2])
         gws = gws.reshape(shape[0], shape[1] * shape[2])
-    elif len(shape) == 2: # linear, out*in
-        tmp = 'do nothing'
-    elif len(shape) == 1: # batchnorm/instancenorm, C; groupnorm x, bias
-        gwr = gwr.reshape(1, shape[0])
-        gws = gws.reshape(1, shape[0])
-        return 0
 
     dis_weight = torch.sum(1 - torch.sum(gwr * gws, dim=-1) / (torch.norm(gwr, dim=-1) * torch.norm(gws, dim=-1) + 0.000001))
-    dis = dis_weight
-    return dis
+    return dis_weight
 
 
 
@@ -275,13 +228,12 @@ def get_loops(ipc):
     elif ipc == 50:
         outer_loop, inner_loop = 50, 10
     else:
-        outer_loop, inner_loop = 0, 0
-        exit('DC error: loop hyper-parameters are not defined for %d ipc'%ipc)
+        outer_loop, inner_loop = ipc, 50 // (ipc//10 + 1)
     return outer_loop, inner_loop
 
 
 
-def epoch(mode, dataloader, net, optimizer, criterion, param_augment, device):
+def epoch(mode, dataloader, net, optimizer, scheduler, criterion, param_augment, device):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(device)
     criterion = criterion.to(device)
@@ -292,15 +244,16 @@ def epoch(mode, dataloader, net, optimizer, criterion, param_augment, device):
         net.eval()
 
     for i_batch, datum in enumerate(dataloader):
-        img = datum[0].float().to(device)
+        text = datum[0].float().to(device)
         if mode == 'train' and param_augment != None:
-            img = augment(img, param_augment, device=device)
+            text = augment(text, param_augment, device=device)
         lab = datum[1].long().to(device)
         n_b = lab.shape[0]
 
-        output = net(img)
-        loss = criterion(output, lab)
-        acc = np.sum(np.equal(np.argmax(output.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
+        output = net(inputs_embeds=text)
+        logits = output.logits
+        loss = criterion(logits, lab)
+        acc = np.sum(np.equal(np.argmax(logits.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
 
         loss_avg += loss.item()*n_b
         acc_avg += acc
@@ -310,39 +263,12 @@ def epoch(mode, dataloader, net, optimizer, criterion, param_augment, device):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
     loss_avg /= num_exp
     acc_avg /= num_exp
 
     return loss_avg, acc_avg
-
-
-
-def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learningrate, batchsize_train, param_augment, device, Epoch = 600):
-    net = net.to(device)
-    images_train = images_train.to(device)
-    labels_train = labels_train.to(device)
-    lr = float(learningrate)
-    lr_schedule = [Epoch//2+1]
-    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
-    criterion = nn.CrossEntropyLoss().to(device)
-
-    dst_train = TensorDataset(images_train, labels_train)
-    trainloader = torch.utils.data.DataLoader(dst_train, batch_size=batchsize_train, shuffle=True, num_workers=0)
-
-    start = time.time()
-    for ep in range(Epoch+1):
-        loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, param_augment, device)
-        if ep in lr_schedule:
-            lr *= 0.1
-            optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
-
-    time_train = time.time() - start
-    loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, param_augment, device)
-    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
-
-    return net, acc_train, acc_test
-
 
 
 def augment(images, param_augment, device):

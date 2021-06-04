@@ -4,12 +4,9 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
-from torchvision.utils import save_image
-from utils import get_loops, get_dataset, get_network, get_eval_pool, evaluate_synset, get_daparam, match_loss, get_time, TensorDataset, epoch
-
+from utils import get_loops, get_dataset, get_network, get_eval_pool, match_loss, get_time, TensorDataset, epoch, vizualize, eval_synthetic
 
 def main():
-
     parser = argparse.ArgumentParser(description='Parameter Processing')
     parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
     parser.add_argument('--model', type=str, default='ConvNet', help='model')
@@ -18,7 +15,7 @@ def main():
     parser.add_argument('--num_exp', type=int, default=5, help='the number of experiments')
     parser.add_argument('--num_eval', type=int, default=20, help='the number of evaluating randomly initialized models')
     parser.add_argument('--epoch_eval_train', type=int, default=300, help='epochs to train a model with synthetic data')
-    parser.add_argument('--Iteration', type=int, default=1000, help='training iterations')
+    parser.add_argument('--K', type=int, default=1000, help='training Ks')
     parser.add_argument('--lr_img', type=float, default=0.1, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_net', type=float, default=0.01, help='learning rate for updating network parameters')
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
@@ -27,11 +24,12 @@ def main():
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
     parser.add_argument('--save_path', type=str, default='result', help='path to save results')
     parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
-    # For speeding up, we can decrease the Iteration and epoch_eval_train, which will not cause significant performance decrease.
+    # For speeding up, we can decrease the K and epoch_eval_train, which will not cause significant performance decrease.
 
 
     args = parser.parse_args()
-    args.outer_loop, args.inner_loop = get_loops(args.ipc)
+    args.T, args.loop_net = get_loops(args.ipc)
+    args.loop_syn = 1
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     if not os.path.exists(args.data_path):
@@ -40,8 +38,9 @@ def main():
     if not os.path.exists(args.save_path):
         os.mkdir(args.save_path)
 
-    eval_it_pool = np.arange(0, args.Iteration+1, 500).tolist() if args.eval_mode == 'S' else [args.Iteration] # The list of iterations when we evaluate models and record results.
-    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader = get_dataset(args.dataset, args.data_path)
+    eval_it_pool = np.arange(0, args.K+1, (args.K+1)//2).tolist() if args.eval_mode == 'S' else [args.K] # The list of Ks when we evaluate models and record results.
+    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test = get_dataset(args.dataset, args.data_path)
+    testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=2)
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
 
@@ -98,39 +97,14 @@ def main():
         criterion = nn.CrossEntropyLoss().to(args.device)
         print('%s training begins'%get_time())
 
-        for it in range(args.Iteration+1):
+        for it in range(args.K+1):
 
             ''' Evaluate synthetic data '''
             if it in eval_it_pool:
-                for model_eval in model_eval_pool:
-                    print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, iteration = %d'%(args.model, model_eval, it))
-                    param_augment = get_daparam(args.dataset, args.model, model_eval, args.ipc)
-                    if param_augment['strategy'] != 'none':
-                        epoch_eval_train = 1000 # More epochs for evaluation with augmentation will be better.
-                        print('data augmentation = %s'%param_augment)
-                    else:
-                        epoch_eval_train = args.epoch_eval_train
-                    accs = []
-                    for it_eval in range(args.num_eval):
-                        net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
-                        image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
-                        _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_net, args.batch_train, param_augment, args.device, epoch_eval_train)
-                        accs.append(acc_test)
-                    print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
-
-                    if it == args.Iteration: # record the final results
-                        accs_all_exps[model_eval] += accs
+                accs_all_exps = eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, testloader, args, channel, num_classes, im_size)
 
                 ''' visualize and save '''
-                save_name = os.path.join(args.save_path, 'vis_%s_%s_%dipc_exp%d_iter%d.png'%(args.dataset, args.model, args.ipc, exp, it))
-                image_syn_vis = copy.deepcopy(image_syn.detach().cpu())
-                for ch in range(channel):
-                    image_syn_vis[:, ch] = image_syn_vis[:, ch]  * std[ch] + mean[ch]
-                image_syn_vis[image_syn_vis<0] = 0.0
-                image_syn_vis[image_syn_vis>1] = 1.0
-                save_image(image_syn_vis, save_name, nrow=args.ipc) # Trying normalize = True/False may get better visual effects.
-                # The generated images would be slightly different from the visualization results in the paper, because of the initialization and normalization of pixels.
-
+                vizualize(image_syn, channel, std, mean, args, exp, it)
 
             ''' Train synthetic data '''
             net = get_network(args.model, channel, num_classes, im_size).to(args.device) # get a random model
@@ -141,7 +115,7 @@ def main():
             loss_avg = 0
 
 
-            for ol in range(args.outer_loop):
+            for t in range(args.T):
 
                 ''' freeze the running mu and sigma for BatchNorm layers '''
                 # Synthetic data batch, e.g. only 1 image/batch, is too small to obtain stable mu and sigma.
@@ -156,7 +130,7 @@ def main():
                 if BN_flag:
                     img_real = torch.cat([get_images(c, BNSizePC) for c in range(num_classes)], dim=0)
                     net.train() # for updating the mu, sigma of BatchNorm
-                    output_real = net(img_real) # get running mu, sigma
+                    _ = net(img_real) # get running mu, sigma
                     for module in net.modules():
                         if 'BatchNorm' in module._get_name():  #BatchNorm
                             module.eval() # fix mu and sigma of every BatchNorm layer
@@ -176,6 +150,8 @@ def main():
                     lab_syn = torch.ones((args.ipc,), device=args.device, dtype=torch.long) * c
                     output_syn = net(img_syn)
                     loss_syn = criterion(output_syn, lab_syn)
+                    
+                    # why create_graph is True?
                     gw_syn = torch.autograd.grad(loss_syn, net_parameters, create_graph=True)
 
                     loss += match_loss(gw_syn, gw_real, args)
@@ -184,10 +160,9 @@ def main():
                 loss.backward()
                 optimizer_img.step()
                 loss_avg += loss.item()
-
-                if ol == args.outer_loop - 1:
+                
+                if t == args.T - 1:
                     break
-
 
                 ''' update network '''
                 image_syn_train, label_syn_train = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach())  # avoid any unaware modification
@@ -197,12 +172,12 @@ def main():
                     epoch('train', trainloader, net, optimizer_net, criterion, None, args.device)
 
 
-            loss_avg /= (num_classes*args.outer_loop)
+            loss_avg /= (num_classes*args.T)
 
             if it%10 == 0:
                 print('%s iter = %04d, loss = %.4f' % (get_time(), it, loss_avg))
 
-            if it == args.Iteration: # only record the final results
+            if it == args.K: # only record the final results
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
                 torch.save({'data': data_save, 'accs_all_exps': accs_all_exps, }, os.path.join(args.save_path, 'res_%s_%s_%dipc.pt'%(args.dataset, args.model, args.ipc)))
 
