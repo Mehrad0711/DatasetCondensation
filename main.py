@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from utils import get_loops, get_dataset, get_network, get_eval_pool, match_loss, get_time, TensorDataset, epoch, vizualize, eval_synthetic
+from torch.utils.tensorboard import SummaryWriter
 
 def main():
     parser = argparse.ArgumentParser(description='Parameter Processing')
@@ -15,7 +16,7 @@ def main():
     parser.add_argument('--num_exp', type=int, default=5, help='the number of experiments')
     parser.add_argument('--num_eval', type=int, default=20, help='the number of evaluating randomly initialized models')
     parser.add_argument('--epoch_eval_train', type=int, default=300, help='epochs to train a model with synthetic data')
-    parser.add_argument('--K', type=int, default=1000, help='training Ks')
+    parser.add_argument('--K', type=int, default=1000, help='training iterations')
     parser.add_argument('--lr_img', type=float, default=0.1, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_net', type=float, default=0.01, help='learning rate for updating network parameters')
     parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
@@ -24,6 +25,7 @@ def main():
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
     parser.add_argument('--save_path', type=str, default='result', help='path to save results')
     parser.add_argument('--dis_metric', type=str, default='ours', help='distance metric')
+    parser.add_argument('--tensorboard_dir', type=str, default='tensorboard/', help='distance metric')
     # For speeding up, we can decrease the K and epoch_eval_train, which will not cause significant performance decrease.
 
 
@@ -31,6 +33,8 @@ def main():
     args.T, args.loop_net = get_loops(args.ipc)
     args.loop_syn = 1
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    writer = SummaryWriter(log_dir=args.tensorboard_dir)
 
     if not os.path.exists(args.data_path):
         os.mkdir(args.data_path)
@@ -114,7 +118,6 @@ def main():
             optimizer_net.zero_grad()
             loss_avg = 0
 
-
             for t in range(args.T):
 
                 ''' freeze the running mu and sigma for BatchNorm layers '''
@@ -168,7 +171,7 @@ def main():
                 image_syn_train, label_syn_train = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach())  # avoid any unaware modification
                 dst_syn_train = TensorDataset(image_syn_train, label_syn_train)
                 trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.batch_train, shuffle=True, num_workers=0)
-                for il in range(args.inner_loop):
+                for il in range(args.loop_net):
                     epoch('train', trainloader, net, optimizer_net, criterion, None, args.device)
 
 
@@ -176,6 +179,7 @@ def main():
 
             if it%10 == 0:
                 print('%s iter = %04d, loss = %.4f' % (get_time(), it, loss_avg))
+                writer.add_scalar(f'exp_{exp}/loss', loss_avg, it)
 
             if it == args.K: # only record the final results
                 data_save.append([copy.deepcopy(image_syn.detach().cpu()), copy.deepcopy(label_syn.detach().cpu())])
@@ -186,7 +190,6 @@ def main():
     for key in model_eval_pool:
         accs = accs_all_exps[key]
         print('Run %d experiments, train on %s, evaluate %d random %s, mean  = %.2f%%  std = %.2f%%'%(args.num_exp, args.model, len(accs), key, np.mean(accs)*100, np.std(accs)*100))
-
 
 
 if __name__ == '__main__':
