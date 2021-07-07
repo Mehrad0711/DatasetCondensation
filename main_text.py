@@ -3,40 +3,17 @@ import os
 import copy
 import time
 import argparse
-from functools import partial
 
 import numpy as np
 import torch
 import torch.nn as nn
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from utils_text import get_loops, get_dataset, get_network, get_eval_pool, match_loss, get_time, TensorDataset, epoch, vizualize, eval_synthetic
+from transformers import AutoTokenizer
+from utils_text import get_loops, get_network, match_loss, get_time, TensorDataset, epoch, initialize_logger, init_opt
 
-from transformers import (
-    AdamW,
-    get_constant_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
-    get_linear_schedule_with_warmup,
-)
 from transformers import logging
 
 logging.set_verbosity_error()
-
-import logging
-
-# logger = logging.getLogger(__name__)
-# logger.setLevel('DEBUG')
-
-def initialize_logger():
-    # set up file logger
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.DEBUG)
-    logger.addHandler(handler)
-    logger.propagate = False
-
-    return logger
 
 logger = initialize_logger()
 
@@ -64,90 +41,12 @@ def main():
     parser.add_argument('--loop_net', type=int, help='')
     parser.add_argument('--warmup', default=40, type=int, help='warmup for learning rate. setting it to 1 disables warmup.')
     parser.add_argument('--grad_clip', default=1.0, type=float, help='gradient clipping')
-    parser.add_argument(
-        '--beta0',
-        default=0.9,
-        type=float,
-        help='alternative momentum for Adam (only when not using transformer scheduler), and RAdam',
-    )
-    parser.add_argument(
-        '--optimizer', default='adam', choices=['adam', 'adamw', 'sgd', 'radam'], type=str, help='optimizer to use'
-    )
-    parser.add_argument(
-        '--lr_schedule',
-        type=str,
-        default='transformer',
-        choices=['transformer', 'constant', 'linear', 'sgd', 'cosine'],
-        help='The learning rate strategy. All of them can be used with or without warmup.',
-    )
-    parser.add_argument(
-        '--lr_multiply_syn',
-        default=0.01,
-        type=float,
-        help='Multiplier for the `transformer` learning rate scheduler, constant value for `constant` and maximum value for `linear` and `cosine` schedulers.',
-    )
-    parser.add_argument(
-        '--lr_multiply_net',
-        default=0.01,
-        type=float,
-        help='Multiplier for the `transformer` learning rate scheduler, constant value for `constant` and maximum value for `linear` and `cosine` schedulers.',
-    )
+    parser.add_argument( '--beta0', default=0.9, type=float, help='alternative momentum for Adam (only when not using transformer scheduler), and RAdam', )
+    parser.add_argument( '--optimizer', default='adam', choices=['adam', 'adamw', 'sgd', 'radam'], type=str, help='optimizer to use' )
+    parser.add_argument( '--lr_schedule', type=str, default='transformer', choices=['transformer', 'constant', 'linear', 'sgd', 'cosine'], help='The learning rate strategy. All of them can be used with or without warmup.', )
+    parser.add_argument( '--lr_multiply_syn', default=0.01, type=float, help='Multiplier for the `transformer` learning rate scheduler, constant value for `constant` and maximum value for `linear` and `cosine` schedulers.', )
+    parser.add_argument( '--lr_multiply_net', default=0.01, type=float, help='Multiplier for the `transformer` learning rate scheduler, constant value for `constant` and maximum value for `linear` and `cosine` schedulers.', )
     parser.add_argument('--weight_decay', default=0.0, type=float, help='weight L2 regularization')
-
-    def get_transformer_learning_rate(i, *, dimension, warmup):
-        i += 1
-        return 1.0 / math.sqrt(dimension) * min(1 / math.sqrt(i), i / (warmup * math.sqrt(warmup)))
-
-    def get_sgd_learning_rate(i, *, warmup):
-        i += 1
-        return min(math.sqrt(warmup) / math.sqrt(i), i / warmup)
-
-    def init_opt(args, lr_multiply, params):
-        if args.optimizer == 'adam':
-            # Adam with transformer schedule has a different set of default hyperparameters:
-            if args.lr_schedule == 'transformer':
-                opt = torch.optim.Adam(
-                    params, lr=lr_multiply, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay
-                )
-            else:
-                opt = torch.optim.Adam(
-                    params, lr=lr_multiply, betas=(args.beta0, 0.999), weight_decay=args.weight_decay
-                )
-        elif args.optimizer == 'adamw':
-            opt = AdamW(params, lr=lr_multiply, weight_decay=args.weight_decay)
-        elif args.optimizer == 'radam':
-            import radam
-            opt = radam.RAdam(params, lr=lr_multiply, betas=(args.beta0, 0.999),
-                              weight_decay=args.weight_decay)
-        else:
-            assert args.optimizer == 'sgd'
-            opt = torch.optim.SGD(params, lr=lr_multiply, weight_decay=args.weight_decay)
-    
-        if args.lr_schedule == 'transformer':
-            lr_lambda = partial(get_transformer_learning_rate, dimension=args.dimension, warmup=args.warmup)
-            scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-        elif args.lr_schedule == 'constant':
-            scheduler = get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
-        elif args.lr_schedule == 'linear':
-            scheduler = get_linear_schedule_with_warmup(
-                opt,
-                num_training_steps=sum(args.train_iterations) // args.gradient_accumulation_steps,
-                num_warmup_steps=args.warmup,
-            )
-        elif args.lr_schedule == 'cosine':
-            scheduler = get_cosine_schedule_with_warmup(
-                opt,
-                num_training_steps=sum(args.train_iterations) // args.gradient_accumulation_steps,
-                num_warmup_steps=args.warmup,
-                num_cycles=0.5,
-            )
-        elif args.lr_schedule == 'sgd':
-            lr_lambda = partial(get_sgd_learning_rate, warmup=args.warmup)
-            scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-        else:
-            raise ValueError('Invalid learning rate scheduler.')
-    
-        return opt, scheduler
 
     args = parser.parse_args()
     T, loop_net = get_loops(args.tpc)
@@ -171,16 +70,6 @@ def main():
     dataset = load_dataset(args.dataset_name, keep_in_memory=False)
     tokenizer = AutoTokenizer.from_pretrained('bert-base-cased', use_fast=False)
 
-    def freeze_params(model):
-        for name, par in model.named_parameters():
-            if 'classifier' in name:
-                continue
-            par.requires_grad = False
-
-    def unfreeze_params(model):
-        for par in model.parameters():
-            par.requires_grad = True
-
     train, test = list(dataset['train']), list(dataset['test'])
     np.random.shuffle(train)
     np.random.shuffle(test)
@@ -196,7 +85,6 @@ def main():
     test_tokenized = test_tokenized.to(args.device)
 
     test_label = torch.tensor(test_labels, dtype=torch.long, requires_grad=False, device=args.device).view(-1)  # [0,0,0, 1,1,1, ..., 9,9,9]
-    
     
     # testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=2)
     # model_eval_pool = get_eval_pool(args.eval_mode, args.model_name, args.model_name)
@@ -252,7 +140,8 @@ def main():
 
 
         ''' training '''
-        optimizer_text, scheduler_text = init_opt(args, args.lr_multiply_syn, [syn_embedded, ])
+        optimizer_text, scheduler_text = init_opt(get_transformer_learning_rate, get_sgd_learning_rate, args,
+                                                  args.lr_multiply_syn, [syn_embedded, ])
         optimizer_text = torch.optim.SGD([syn_embedded, ], lr=args.lr_multiply_syn, momentum=0.5) # optimizer_text for synthetic data
         optimizer_text.zero_grad()
         criterion = nn.CrossEntropyLoss().to(args.device)
@@ -273,7 +162,8 @@ def main():
             net = get_network(args, num_classes)
             net.train()
             net_parameters = list(net.parameters())
-            optimizer_net, scheduler_net = init_opt(args, args.lr_multiply_net, net.parameters())
+            optimizer_net, scheduler_net = init_opt(get_transformer_learning_rate, get_sgd_learning_rate, args,
+                                                    args.lr_multiply_net, net.parameters())
             optimizer_net.zero_grad()
             loss_avg = 0
 
@@ -298,7 +188,7 @@ def main():
                     
                     # why create_graph is True?
                     # use allow unused because we pass embeddings for syn instead of ids so word_embedding is not backpropped
-                    gw_syn = torch.autograd.grad(loss_syn, net_parameters, create_graph=True, allow_unused=True)
+                    gw_syn = torch.autograd.grad(loss_syn, net_parameters, create_graph=True, retain_graph=False, allow_unused=True)
                     
                     # pop the first gradient which is None for gw_syn
                     gw_real = gw_real[1:]

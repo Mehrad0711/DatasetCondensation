@@ -1,18 +1,102 @@
 import os
 import copy
 import time
+from functools import partial
+
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset
-from torchvision import datasets, transforms
-from scipy.ndimage.interpolation import rotate as scipyrotate
-from transformers import AutoModelForSequenceClassification
+from transformers import AutoModelForSequenceClassification, AdamW, get_constant_schedule_with_warmup, \
+    get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-from networks import MLP, ConvNet, LeNet, AlexNet, VGG11BN, VGG11, ResNet18, ResNet18BN_AP
 from torchvision.utils import save_image
 
+import logging
+
+
+def initialize_logger():
+    # set up file logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    logger.propagate = False
+
+    return logger
+
+logger = logging.getLogger(__name__)
+
+
+def freeze_params(model):
+    for name, par in model.named_parameters():
+        if 'classifier' in name:
+            continue
+        par.requires_grad = False
+
+
+def unfreeze_params(model):
+    for par in model.parameters():
+        par.requires_grad = True
+
+
+def get_transformer_learning_rate(i, *, dimension, warmup):
+    i += 1
+    return 1.0 / math.sqrt(dimension) * min(1 / math.sqrt(i), i / (warmup * math.sqrt(warmup)))
+
+
+def get_sgd_learning_rate(i, *, warmup):
+    i += 1
+    return min(math.sqrt(warmup) / math.sqrt(i), i / warmup)
+
+
+def init_opt(args, lr_multiply, params):
+    if args.optimizer == 'adam':
+        # Adam with transformer schedule has a different set of default hyperparameters:
+        if args.lr_schedule == 'transformer':
+            opt = torch.optim.Adam(
+                params, lr=lr_multiply, betas=(0.9, 0.98), eps=1e-9, weight_decay=args.weight_decay
+            )
+        else:
+            opt = torch.optim.Adam(
+                params, lr=lr_multiply, betas=(args.beta0, 0.999), weight_decay=args.weight_decay
+            )
+    elif args.optimizer == 'adamw':
+        opt = AdamW(params, lr=lr_multiply, weight_decay=args.weight_decay)
+    elif args.optimizer == 'radam':
+        import radam
+        opt = radam.RAdam(params, lr=lr_multiply, betas=(args.beta0, 0.999),
+                          weight_decay=args.weight_decay)
+    else:
+        assert args.optimizer == 'sgd'
+        opt = torch.optim.SGD(params, lr=lr_multiply, weight_decay=args.weight_decay)
+
+    if args.lr_schedule == 'transformer':
+        lr_lambda = partial(get_transformer_learning_rate, dimension=args.dimension, warmup=args.warmup)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    elif args.lr_schedule == 'constant':
+        scheduler = get_constant_schedule_with_warmup(opt, num_warmup_steps=args.warmup)
+    elif args.lr_schedule == 'linear':
+        scheduler = get_linear_schedule_with_warmup(
+            opt,
+            num_training_steps=sum(args.train_iterations) // args.gradient_accumulation_steps,
+            num_warmup_steps=args.warmup,
+        )
+    elif args.lr_schedule == 'cosine':
+        scheduler = get_cosine_schedule_with_warmup(
+            opt,
+            num_training_steps=sum(args.train_iterations) // args.gradient_accumulation_steps,
+            num_warmup_steps=args.warmup,
+            num_cycles=0.5,
+        )
+    elif args.lr_schedule == 'sgd':
+        lr_lambda = partial(get_sgd_learning_rate, warmup=args.warmup)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    else:
+        raise ValueError('Invalid learning rate scheduler.')
+
+    return opt, scheduler
 
 
 def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learningrate, batchsize_train, param_augment, device, Epoch = 600):
@@ -36,21 +120,21 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learni
 
     time_train = time.time() - start
     loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, param_augment, device)
-    print('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
+    logger.info('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
 
     return net, acc_train, acc_test
 
 
 def eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, testloader, args, num_classes):
     for model_eval in model_eval_pool:
-        print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, K = %d'%(args.model_name, model_eval, it))
+        logger.info('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, K = %d'%(args.model_name, model_eval, it))
         accs = []
         for it_eval in range(args.num_eval):
             net_eval = get_network(args, num_classes)
             image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
             _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_multiply_net, args.batch_train, args.device, args.epoch_eval_train)
             accs.append(acc_test)
-        print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
+        logger.info('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
         
         if it == args.K: # record the final results
             accs_all_exps[model_eval] += accs
@@ -66,59 +150,6 @@ def vizualize(image_syn, channel, std, mean, args, exp, it):
     image_syn_vis[image_syn_vis > 1] = 1.0
     save_image(image_syn_vis, save_name, nrow=args.ipc)  # Trying normalize = True/False may get better visual effects.
     # The generated images would be slightly different from the visualization results in the paper, because of the initialization and normalization of pixels.
-
-
-def get_dataset(dataset, data_path):
-    if dataset == 'MNIST':
-        channel = 1
-        im_size = (28, 28)
-        num_classes = 10
-        mean = [0.1307]
-        std = [0.3081]
-        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])
-        dst_train = datasets.MNIST(data_path, train=True, download=True, transform=transform) # no augmentation
-        dst_test = datasets.MNIST(data_path, train=False, download=True, transform=transform)
-        class_names = [str(c) for c in range(num_classes)]
-
-    elif dataset == 'FashionMNIST':
-        channel = 1
-        im_size = (28, 28)
-        num_classes = 10
-        mean = [0.2861]
-        std = [0.3530]
-        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])
-        dst_train = datasets.FashionMNIST(data_path, train=True, download=True, transform=transform) # no augmentation
-        dst_test = datasets.FashionMNIST(data_path, train=False, download=True, transform=transform)
-        class_names = dst_train.classes
-
-    elif dataset == 'SVHN':
-        channel = 3
-        im_size = (32, 32)
-        num_classes = 10
-        mean = [0.4377, 0.4438, 0.4728]
-        std = [0.1980, 0.2010, 0.1970]
-        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])
-        dst_train = datasets.SVHN(data_path, split='train', download=True, transform=transform)  # no augmentation
-        dst_test = datasets.SVHN(data_path, split='test', download=True, transform=transform)
-        class_names = [str(c) for c in range(num_classes)]
-
-    elif dataset == 'CIFAR10':
-        channel = 3
-        im_size = (32, 32)
-        num_classes = 10
-        mean = [0.4914, 0.4822, 0.4465]
-        std = [0.2023, 0.1994, 0.2010]
-        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(mean=mean, std=std)])
-        dst_train = datasets.CIFAR10(data_path, train=True, download=True, transform=transform) # no augmentation
-        dst_test = datasets.CIFAR10(data_path, train=False, download=True, transform=transform)
-        class_names = dst_train.classes
-
-    else:
-        exit('unknown dataset: %s'%dataset)
-
-    testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=2)
-    return channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader
-
 
 
 class TensorDataset(Dataset):
@@ -245,8 +276,6 @@ def epoch(mode, dataloader, net, optimizer, scheduler, criterion, param_augment,
 
     for i_batch, datum in enumerate(dataloader):
         text = datum[0].float().to(device)
-        if mode == 'train' and param_augment != None:
-            text = augment(text, param_augment, device=device)
         lab = datum[1].long().to(device)
         n_b = lab.shape[0]
 
@@ -269,89 +298,6 @@ def epoch(mode, dataloader, net, optimizer, scheduler, criterion, param_augment,
     acc_avg /= num_exp
 
     return loss_avg, acc_avg
-
-
-def augment(images, param_augment, device):
-    # This can be sped up in the future.
-
-    if param_augment != None and param_augment['strategy'] != 'none':
-        scale = param_augment['scale']
-        crop = param_augment['crop']
-        rotate = param_augment['rotate']
-        noise = param_augment['noise']
-        strategy = param_augment['strategy']
-
-        shape = images.shape
-        mean = []
-        for c in range(shape[1]):
-            mean.append(float(torch.mean(images[:,c])))
-
-        def cropfun(i):
-            im_ = torch.zeros(shape[1],shape[2]+crop*2,shape[3]+crop*2, dtype=torch.float, device=device)
-            for c in range(shape[1]):
-                im_[c] = mean[c]
-            im_[:, crop:crop+shape[2], crop:crop+shape[3]] = images[i]
-            r, c = np.random.permutation(crop*2)[0], np.random.permutation(crop*2)[0]
-            images[i] = im_[:, r:r+shape[2], c:c+shape[3]]
-
-        def scalefun(i):
-            h = int((np.random.uniform(1 - scale, 1 + scale)) * shape[2])
-            w = int((np.random.uniform(1 - scale, 1 + scale)) * shape[2])
-            tmp = F.interpolate(images[i:i + 1], [h, w], )[0]
-            mhw = max(h, w, shape[2], shape[3])
-            im_ = torch.zeros(shape[1], mhw, mhw, dtype=torch.float, device=device)
-            r = int((mhw - h) / 2)
-            c = int((mhw - w) / 2)
-            im_[:, r:r + h, c:c + w] = tmp
-            r = int((mhw - shape[2]) / 2)
-            c = int((mhw - shape[3]) / 2)
-            images[i] = im_[:, r:r + shape[2], c:c + shape[3]]
-
-        def rotatefun(i):
-            im_ = scipyrotate(images[i].cpu().data.numpy(), angle=np.random.randint(-rotate, rotate), axes=(-2, -1), cval=np.mean(mean))
-            r = int((im_.shape[-2] - shape[-2]) / 2)
-            c = int((im_.shape[-1] - shape[-1]) / 2)
-            images[i] = torch.tensor(im_[:, r:r + shape[-2], c:c + shape[-1]], dtype=torch.float, device=device)
-
-        def noisefun(i):
-            images[i] = images[i] + noise * torch.randn(shape[1:], dtype=torch.float, device=device)
-
-
-        augs = strategy.split('_')
-
-        for i in range(shape[0]):
-            choice = np.random.permutation(augs)[0] # randomly implement one augmentation
-            if choice == 'crop':
-                cropfun(i)
-            elif choice == 'scale':
-                scalefun(i)
-            elif choice == 'rotate':
-                rotatefun(i)
-            elif choice == 'noise':
-                noisefun(i)
-
-    return images
-
-
-
-def get_daparam(dataset, model, model_eval, ipc):
-    # We find that augmentation doesn't always benefit the performance.
-    # So we do augmentation for some of the settings.
-
-    param_augment = dict()
-    param_augment['crop'] = 4
-    param_augment['scale'] = 0.2
-    param_augment['rotate'] = 45
-    param_augment['noise'] = 0.001
-    param_augment['strategy'] = 'none'
-
-    if dataset == 'MNIST':
-        param_augment['strategy'] = 'crop_scale_rotate'
-
-    if model_eval in ['ConvNetBN']: # Data augmentation makes model training with Batch Norm layer easier.
-        param_augment['strategy'] = 'crop_noise'
-
-    return param_augment
 
 
 def get_eval_pool(eval_mode, model, model_eval):
