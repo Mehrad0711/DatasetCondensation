@@ -221,7 +221,7 @@ def main():
 
             if k % 10 == 0:
                 logger.info('%s iter = %04d, loss = %.4f' % (get_time(), k, loss_avg))
-                writer.add_scalar(f'exp_{exp}/loss', loss_avg, k)
+                writer.add_scalar(f'dist_cond/exp_{exp}/loss', loss_avg, k)
 
             # only record the final results
             if k == args.K:
