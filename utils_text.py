@@ -15,6 +15,9 @@ from torchvision.utils import save_image
 
 import logging
 
+# NOTES
+# real eval set is not used to find best checkpoint when training on synthetic, why?
+
 
 def initialize_logger():
     # set up file logger
@@ -99,47 +102,46 @@ def init_opt(args, lr_multiply, params):
 
     return opt, scheduler
 
-
-def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learningrate, batchsize_train, param_augment, device, Epoch = 600):
-    net = net.to(device)
-    images_train = images_train.to(device)
-    labels_train = labels_train.to(device)
-    lr = float(learningrate)
-    lr_schedule = [Epoch//2+1]
-    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
-    criterion = nn.CrossEntropyLoss().to(device)
-
-    dst_train = TensorDataset(images_train, labels_train)
-    trainloader = torch.utils.data.DataLoader(dst_train, batch_size=batchsize_train, shuffle=True, num_workers=0)
-
-    start = time.time()
-    for ep in range(Epoch+1):
-        loss_train, acc_train = epoch('train', trainloader, net, optimizer, criterion, param_augment, device)
-        if ep in lr_schedule:
-            lr *= 0.1
-            optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
-
-    time_train = time.time() - start
-    loss_test, acc_test = epoch('test', testloader, net, optimizer, criterion, param_augment, device)
-    logger.info('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
-
-    return net, acc_train, acc_test
-
-
 def eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, testloader, args, num_classes):
     for model_eval in model_eval_pool:
         logger.info('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, K = %d'%(args.model_name, model_eval, it))
         accs = []
         for it_eval in range(args.num_eval):
             net_eval = get_network(args, num_classes)
-            image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
-            _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_multiply_net, args.batch_train, args.device, args.epoch_eval_train)
+            image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unwanted modifications
+            _, _, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_multiply_net, args.batch_train, args, args.device, args.epoch_eval_train)
             accs.append(acc_test)
         logger.info('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
         
         if it == args.K: # record the final results
             accs_all_exps[model_eval] += accs
     return accs_all_exps
+
+def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learningrate, batchsize_train, args, device, Epoch=600):
+    net = net.to(device)
+    images_train = images_train.to(device)
+    labels_train = labels_train.to(device)
+    lr = float(learningrate)
+    lr_schedule = [Epoch//2+1]
+    optimizer, scheduler = init_opt(args, lr, list(net.parameters()))
+    # optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    dst_train = TensorDataset(images_train, labels_train)
+    trainloader = torch.utils.data.DataLoader(dst_train, batch_size=batchsize_train, shuffle=True)
+
+    start = time.time()
+    for ep in range(Epoch+1):
+        loss_train, acc_train = epoch('train', trainloader, net, optimizer, scheduler, criterion, device)
+        if ep in lr_schedule:
+            lr *= 0.1
+            optimizer, scheduler = init_opt(args, lr, list(net.parameters()))
+
+    time_train = time.time() - start
+    loss_test, acc_test = epoch('test', testloader, net, optimizer, scheduler, criterion, device)
+    logger.info('%s Evaluate_%02d: epoch = %04d train time = %d s train loss = %.6f train acc = %.4f, test acc = %.4f' % (get_time(), it_eval, Epoch, int(time_train), loss_train, acc_train, acc_test))
+
+    return net, acc_train, acc_test
 
 
 def vizualize(image_syn, channel, std, mean, args, exp, it):
@@ -154,8 +156,8 @@ def vizualize(image_syn, channel, std, mean, args, exp, it):
 
 
 class TensorDataset(Dataset):
-    def __init__(self, text, labels): # images: n x c x h x w tensor
-        self.text = text.detach().float()
+    def __init__(self, text, labels):
+        self.text = text.detach()
         self.labels = labels.detach()
 
     def __getitem__(self, index):
@@ -165,33 +167,20 @@ class TensorDataset(Dataset):
         return self.text.shape[0]
 
 
-
-def get_default_convnet_setting():
-    net_width, net_depth, net_act, net_norm, net_pooling = 128, 3, 'relu', 'instancenorm', 'avgpooling'
-    return net_width, net_depth, net_act, net_norm, net_pooling
-
-
-
 def get_network(args, num_classes):
     torch.random.manual_seed(int(time.time() * 1000) % 100000)
-    net = AutoModelForSequenceClassification.from_pretrained('bert-base-cased', num_labels=num_classes)
+    net = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=num_classes)
     # freeze_params(model) # freeze model except for classification layer
     gpu_num = torch.cuda.device_count()
-    if gpu_num > 0:
-        device = 'cuda'
-        if gpu_num>1:
-            net = nn.DataParallel(net)
-    else:
-        device = 'cpu'
+    if gpu_num > 1 and args.device == 'cuda':
+        net = nn.DataParallel(net)
     net = net.to(args.device)
 
     return net
 
 
-
 def get_time():
     return str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))
-
 
 
 def distance_wb(gwr, gws):
@@ -265,7 +254,7 @@ def get_loops(ipc):
 
 
 
-def epoch(mode, dataloader, net, optimizer, scheduler, criterion, param_augment, device):
+def epoch(mode, dataloader, net, optimizer, scheduler, criterion, device):
     loss_avg, acc_avg, num_exp = 0, 0, 0
     net = net.to(device)
     criterion = criterion.to(device)
@@ -276,11 +265,16 @@ def epoch(mode, dataloader, net, optimizer, scheduler, criterion, param_augment,
         net.eval()
 
     for i_batch, datum in enumerate(dataloader):
-        text = datum[0].float().to(device)
-        lab = datum[1].long().to(device)
+        text = datum[0].to(device)
+        lab = datum[1].to(device)
         n_b = lab.shape[0]
-
-        output = net(inputs_embeds=text)
+        
+        if mode == 'train':
+            # synthesized data is in embedding form
+            output = net(inputs_embeds=text)
+        else:
+            # test real data is in id form
+            output = net(input_ids=text)
         logits = output.logits
         loss = criterion(logits, lab)
         acc = np.sum(np.equal(np.argmax(logits.cpu().data.numpy(), axis=-1), lab.cpu().data.numpy()))
@@ -301,7 +295,7 @@ def epoch(mode, dataloader, net, optimizer, scheduler, criterion, param_augment,
     return loss_avg, acc_avg
 
 
-def get_eval_pool(eval_mode, model, model_eval):
+def get_eval_pool(eval_mode, model):
     if eval_mode == 'M': # multiple architectures
         model_eval_pool = ['MLP', 'ConvNet', 'LeNet', 'AlexNet', 'VGG11', 'ResNet18']
     elif eval_mode == 'W': # ablation study on network width
@@ -317,5 +311,5 @@ def get_eval_pool(eval_mode, model, model_eval):
     elif eval_mode == 'S': # itself
         model_eval_pool = [model[:model.index('BN')]] if 'BN' in model else [model]
     else:
-        model_eval_pool = [model_eval]
+        model_eval_pool = [model]
     return model_eval_pool

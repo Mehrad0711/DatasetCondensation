@@ -50,12 +50,13 @@ def main():
     
     if not os.path.exists(args.save_path):
         os.mkdir(args.save_path)
+
+    # evaluate on synthetic data at these iterations
+    eval_it_pool = np.arange(0, args.K + 1, (args.K + 1) // 2).tolist() if args.eval_mode == 'S' else [args.K]
     
-    eval_it_pool = np.arange(0, args.K + 1, (args.K + 1) // 2).tolist() if args.eval_mode == 'S' else [
-        args.K]  # evaluate on synthetic data at these iterations
     channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test = get_dataset(args.dataset,
                                                                                              args.data_path)
-    testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False, num_workers=2)
+    testloader = torch.utils.data.DataLoader(dst_test, batch_size=256, shuffle=False)
     model_eval_pool = get_eval_pool(args.eval_mode,
                                     args.model)  # list of models to evaluate on synthetic data at iterations specified in eval_it_pool
     
@@ -64,39 +65,39 @@ def main():
         accs_all_exps[key] = []
     
     data_save = []
+
+    ''' organize the real dataset '''
+    images_all = []
+    labels_all = []
+    indices_class = [[] for c in range(num_classes)]
+
+    images_all = [torch.unsqueeze(dst_train[i][0], dim=0) for i in range(len(dst_train))]
+    labels_all = [dst_train[i][1] for i in range(len(dst_train))]
+    for i, lab in enumerate(labels_all):
+        indices_class[lab].append(i)
+    images_all = torch.cat(images_all, dim=0).to(args.device)
+    labels_all = torch.tensor(labels_all, dtype=torch.long, device=args.device)
+
+    for c in range(num_classes):
+        print('class c = %d: %d real images' % (c, len(indices_class[c])))
+
+    def get_real_images(c, batch_size):  # get random n images from class c
+        idx_shuffle = np.random.permutation(indices_class[c])[:batch_size]
+        return images_all[idx_shuffle], labels_all[idx_shuffle]
+
+    for ch in range(channel):
+        print('real images channel %d, mean = %.4f, std = %.4f' % (
+            ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
     
     for exp in range(args.num_exp):
         print('\n================== Exp %d ==================\n ' % exp)
         print('Hyper-parameters: \n', args.__dict__)
         print('Evaluation model pool: ', model_eval_pool)
         
-        ''' organize the real dataset '''
-        images_all = []
-        labels_all = []
-        indices_class = [[] for c in range(num_classes)]
-        
-        images_all = [torch.unsqueeze(dst_train[i][0], dim=0) for i in range(len(dst_train))]
-        labels_all = [dst_train[i][1] for i in range(len(dst_train))]
-        for i, lab in enumerate(labels_all):
-            indices_class[lab].append(i)
-        images_all = torch.cat(images_all, dim=0).to(args.device)
-        labels_all = torch.tensor(labels_all, dtype=torch.long, device=args.device)
-        
-        for c in range(num_classes):
-            print('class c = %d: %d real images' % (c, len(indices_class[c])))
-        
-        def get_real_images(c, batch_size):  # get random n images from class c
-            idx_shuffle = np.random.permutation(indices_class[c])[:batch_size]
-            return images_all[idx_shuffle], labels_all[idx_shuffle]
-        
-        for ch in range(channel):
-            print('real images channel %d, mean = %.4f, std = %.4f' % (
-            ch, torch.mean(images_all[:, ch]), torch.std(images_all[:, ch])))
-        
         ''' initialize the synthetic data '''
         image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float,
                                 requires_grad=True, device=args.device)
-        label_syn = torch.tensor([np.ones(args.ipc) * i for i in range(num_classes)], dtype=torch.long,
+        label_syn = torch.tensor([np.ones(args.ipc, dtype='int64') * i for i in range(num_classes)], dtype=torch.long,
                                  requires_grad=False, device=args.device).view(-1)  # [0,0,0, 1,1,1, ..., 9,9,9]
         
         if args.ink == 'real':
@@ -164,8 +165,7 @@ def main():
                     # note we only detach real image gradients but not synthesized ones
                     gw_real = list((grad.detach().clone() for grad in gw_real))
                     
-                    img_syn = image_syn[c * args.ipc:(c + 1) * args.ipc].reshape(
-                        (args.ipc, channel, im_size[0], im_size[1]))
+                    img_syn = image_syn[c * args.ipc:(c + 1) * args.ipc].reshape((args.ipc, channel, im_size[0], im_size[1]))
                     lab_syn = torch.ones((args.ipc,), device=args.device, dtype=torch.long) * c
                     output_syn = net(img_syn)
                     loss_syn = criterion(output_syn, lab_syn)
@@ -188,8 +188,7 @@ def main():
                 image_syn_train, label_syn_train = copy.deepcopy(image_syn.detach()), copy.deepcopy(
                     label_syn.detach())  # avoid any unaware modification
                 dst_syn_train = TensorDataset(image_syn_train, label_syn_train)
-                trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.batch_train, shuffle=True,
-                                                          num_workers=0)
+                trainloader = torch.utils.data.DataLoader(dst_syn_train, batch_size=args.batch_train, shuffle=True)
                 for il in range(args.loop_net):
                     epoch('train', trainloader, net, optimizer_net, criterion, None, args.device)
             
