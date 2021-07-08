@@ -133,7 +133,8 @@ def main():
 
         ''' initialize the synthetic data '''
         max_size = 512
-        syn_ids = np.random.randint(low=0, high=vocab_size-1, size=(num_classes*args.tpc, max_size-4)).tolist()
+        # length is half of maximum data size
+        syn_ids = np.random.randint(low=0, high=vocab_size-1, size=(num_classes*args.tpc, max_size//2)).tolist()
         syn_ids = [(item, None) for item in syn_ids]
         syn_tokenized = tokenizer._batch_prepare_for_model(syn_ids)['input_ids']
         syn_tokenized = torch.tensor(syn_tokenized, dtype=torch.long, requires_grad=False, device=args.device)
