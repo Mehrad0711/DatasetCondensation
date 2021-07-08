@@ -8,7 +8,7 @@ import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoTokenizer
 from utils_text import get_loops, get_network, match_loss, get_time, TensorDataset, epoch, initialize_logger, init_opt, \
-    get_eval_pool, eval_synthetic
+    get_eval_pool, eval_synthetic, set_seed, get_trainable_params
 
 from torch.utils.tensorboard import SummaryWriter
 from transformers import logging
@@ -50,6 +50,7 @@ def main():
     parser.add_argument('--weight_decay', default=0.0, type=float, help='weight L2 regularization')
     parser.add_argument('--tensorboard_dir', type=str, default='tensorboard/', help='distance metric')
     parser.add_argument('--subsample', type=int, default='2000000000')
+    parser.add_argument('--seed', type=int, default='1994')
 
 
     args = parser.parse_args()
@@ -104,7 +105,9 @@ def main():
 
     data_save = []
 
-    model = get_network(args, num_classes)
+    set_seed(args.seed)
+
+    model = get_network(args, num_classes, 'word_embedding')
     args.dimension = model.config.hidden_size
 
     ''' organize the real dataset '''
@@ -163,10 +166,10 @@ def main():
             #     vizualize(syn_tokenized, channel, std, mean, args, exp, k)
 
             ''' Train synthetic data '''
-            net = get_network(args, num_classes)
+            net = get_network(args, num_classes, 'word_embedding')
             net.train()
-            net_parameters = list(net.parameters())
-            optimizer_net, scheduler_net = init_opt(args, args.lr_multiply_net, net.parameters())
+            trainable_parameters = get_trainable_params(net)
+            optimizer_net, scheduler_net = init_opt(args, args.lr_multiply_net, trainable_parameters)
             optimizer_net.zero_grad()
             loss_avg = 0
 
@@ -179,7 +182,7 @@ def main():
                     output_real = net(input_ids=text_real)
                     logits_real = output_real.logits
                     loss_real = criterion(logits_real, lab_real)
-                    gw_real = torch.autograd.grad(loss_real, net_parameters)
+                    gw_real = torch.autograd.grad(loss_real, trainable_parameters)
                     gw_real = list((_.detach().clone() for _ in gw_real))
 
                     text_syn = syn_embedded[c*args.tpc:(c+1)*args.tpc, :, :]
@@ -189,11 +192,11 @@ def main():
                     loss_syn = criterion(logits_syn, lab_syn)
                     
                     # use allow unused because we pass embeddings for syn instead of ids so word_embedding is not backpropped
-                    gw_syn = torch.autograd.grad(loss_syn, net_parameters, create_graph=True, allow_unused=True)
+                    gw_syn = torch.autograd.grad(loss_syn, trainable_parameters, create_graph=True, allow_unused=False)
                     
                     # pop the first gradient which is None for gw_syn due to ignoring word_embeddings
-                    gw_real = gw_real[1:]
-                    gw_syn = gw_syn[1:]
+                    # gw_real = gw_real[1:]
+                    # gw_syn = gw_syn[1:]
                     
                     loss += match_loss(gw_syn, gw_real, args)
 

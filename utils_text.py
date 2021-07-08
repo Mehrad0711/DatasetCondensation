@@ -1,6 +1,7 @@
 import math
 import os
 import copy
+import random
 import time
 from functools import partial
 
@@ -33,11 +34,33 @@ def initialize_logger():
 logger = logging.getLogger(__name__)
 
 
-def freeze_params(model):
-    for name, par in model.named_parameters():
-        if 'classifier' in name:
-            continue
-        par.requires_grad = False
+def get_network(args, num_classes, freeze_option='none'):
+    net = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=num_classes)
+    if freeze_option != 'none':
+        freeze_params(net, freeze_option)
+    gpu_num = torch.cuda.device_count()
+    if gpu_num > 1 and args.device == 'cuda':
+        net = nn.DataParallel(net)
+    net = net.to(args.device)
+
+    return net
+
+
+def freeze_params(model, option):
+    if option == 'all_but_classifier':
+        for name, par in model.named_parameters():
+            if 'classifier' not in name:
+                par.requires_grad = False
+    
+    elif option == 'all':
+        for name, par in model.named_parameters():
+            if 'classifier' not in name:
+                par.requires_grad = False
+    
+    elif option == 'word_embedding':
+        for name, par in model.named_parameters():
+            if 'word_embedding' in name:
+                par.requires_grad = False
 
 
 def unfreeze_params(model):
@@ -123,7 +146,8 @@ def evaluate_synset(it_eval, net, images_train, labels_train, testloader, learni
     labels_train = labels_train.to(device)
     lr = float(learningrate)
     lr_schedule = [Epoch//2+1]
-    optimizer, scheduler = init_opt(args, lr, list(net.parameters()))
+    trainable_parameters = get_trainable_params(net)
+    optimizer, scheduler = init_opt(args, lr, trainable_parameters)
     # optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=0.0005)
     criterion = nn.CrossEntropyLoss().to(device)
 
@@ -166,18 +190,11 @@ class TensorDataset(Dataset):
     def __len__(self):
         return self.text.shape[0]
 
-
-def get_network(args, num_classes):
-    torch.random.manual_seed(int(time.time() * 1000) % 100000)
-    net = AutoModelForSequenceClassification.from_pretrained(args.model_name, num_labels=num_classes)
-    # freeze_params(model) # freeze model except for classification layer
-    gpu_num = torch.cuda.device_count()
-    if gpu_num > 1 and args.device == 'cuda':
-        net = nn.DataParallel(net)
-    net = net.to(args.device)
-
-    return net
-
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def get_time():
     return str(time.strftime("[%Y-%m-%d %H:%M:%S]", time.localtime()))
@@ -194,6 +211,13 @@ def distance_wb(gwr, gws):
 
     dis_weight = torch.sum(1 - torch.sum(gwr * gws, dim=-1) / (torch.norm(gwr, dim=-1) * torch.norm(gws, dim=-1) + 0.000001))
     return dis_weight
+
+def get_trainable_params(model, name=False):
+    # TODO is always called with name=False, so remove the if statement
+    if name:
+        return list(filter(lambda p: p[1].requires_grad, model.named_parameters()))
+    else:
+        return list(filter(lambda p: p.requires_grad, model.parameters()))
 
 
 
