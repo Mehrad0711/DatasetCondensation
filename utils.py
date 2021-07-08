@@ -15,7 +15,7 @@ from torchvision.utils import save_image
 def eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, testloader, args, channel, num_classes, im_size):
     for model_eval in model_eval_pool:
         print('-------------------------\nEvaluation\nmodel_train = %s, model_eval = %s, K = %d'%(args.model, model_eval, it))
-        param_augment = get_daparam(args.dataset, args.model, model_eval, args.ipc)
+        param_augment = get_daparam(args.dataset, model_eval)
         if param_augment['strategy'] != 'none':
             epoch_eval_train = 1000 # More epochs for evaluation with augmentation will be better.
             print('data augmentation = %s'%param_augment)
@@ -25,7 +25,9 @@ def eval_synthetic(it, model_eval_pool, accs_all_exps, image_syn, label_syn, tes
         for it_eval in range(args.num_eval):
             net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
             image_syn_eval, label_syn_eval = copy.deepcopy(image_syn.detach()), copy.deepcopy(label_syn.detach()) # avoid any unaware modification
-            _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_net, args.batch_train, param_augment, args.device, epoch_eval_train)
+            
+            _, _, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args.lr_net, args.batch_train, param_augment, args.device, epoch_eval_train)
+            
             accs.append(acc_test)
         print('Evaluate %d random %s, mean = %.4f std = %.4f\n-------------------------'%(len(accs), model_eval, np.mean(accs), np.std(accs)))
         
@@ -224,7 +226,7 @@ def distance_wb(gwr, gws):
 
 
 def match_loss(gw_syn, gw_real, args):
-    dis = torch.tensor(0.0).to(args.device)
+    dis = torch.tensor(0.0, device=args.device)
 
     if args.dis_metric == 'ours':
         for ig in range(len(gw_real)):
@@ -408,7 +410,7 @@ def augment(images, param_augment, device):
 
 
 
-def get_daparam(dataset, model, model_eval, ipc):
+def get_daparam(dataset, model_eval):
     # We find that augmentation doesn't always benefit the performance.
     # So we do augmentation for some of the settings.
 
@@ -419,8 +421,8 @@ def get_daparam(dataset, model, model_eval, ipc):
     param_augment['noise'] = 0.001
     param_augment['strategy'] = 'none'
 
-    if dataset == 'MNIST':
-        param_augment['strategy'] = 'crop_scale_rotate'
+    # if dataset == 'MNIST':
+    #     param_augment['strategy'] = 'crop_scale_rotate'
 
     if model_eval in ['ConvNetBN']: # Data augmentation makes model training with Batch Norm layer easier.
         param_augment['strategy'] = 'crop_noise'
@@ -428,7 +430,7 @@ def get_daparam(dataset, model, model_eval, ipc):
     return param_augment
 
 
-def get_eval_pool(eval_mode, model, model_eval):
+def get_eval_pool(eval_mode, model):
     if eval_mode == 'M': # multiple architectures
         model_eval_pool = ['MLP', 'ConvNet', 'LeNet', 'AlexNet', 'VGG11', 'ResNet18']
     elif eval_mode == 'W': # ablation study on network width
@@ -444,5 +446,5 @@ def get_eval_pool(eval_mode, model, model_eval):
     elif eval_mode == 'S': # itself
         model_eval_pool = [model[:model.index('BN')]] if 'BN' in model else [model]
     else:
-        model_eval_pool = [model_eval]
+        model_eval_pool = [model]
     return model_eval_pool

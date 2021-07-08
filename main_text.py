@@ -140,8 +140,7 @@ def main():
 
 
         ''' training '''
-        optimizer_text, scheduler_text = init_opt(get_transformer_learning_rate, get_sgd_learning_rate, args,
-                                                  args.lr_multiply_syn, [syn_embedded, ])
+        optimizer_text, scheduler_text = init_opt(args, args.lr_multiply_syn, [syn_embedded, ])
         optimizer_text = torch.optim.SGD([syn_embedded, ], lr=args.lr_multiply_syn, momentum=0.5) # optimizer_text for synthetic data
         optimizer_text.zero_grad()
         criterion = nn.CrossEntropyLoss().to(args.device)
@@ -162,8 +161,7 @@ def main():
             net = get_network(args, num_classes)
             net.train()
             net_parameters = list(net.parameters())
-            optimizer_net, scheduler_net = init_opt(get_transformer_learning_rate, get_sgd_learning_rate, args,
-                                                    args.lr_multiply_net, net.parameters())
+            optimizer_net, scheduler_net = init_opt(args, args.lr_multiply_net, net.parameters())
             optimizer_net.zero_grad()
             loss_avg = 0
 
